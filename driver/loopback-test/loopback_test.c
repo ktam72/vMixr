@@ -44,6 +44,10 @@ static double gPhaseL;
 static double gPhaseR;
 static double gPhaseIncL;
 static double gPhaseIncR;
+// REQ-105 latency probe: total frames written to the source output, and the
+// output-frame index at which a one-sample full-scale spike is written.
+static unsigned gOutFrames;
+#define kSpikeFrame ((unsigned)(kSampleRate / 2))
 // Capture from all 4 devices' inputs (0..3).
 static float gCapture[kDevices][2 * kCaptureFrames];
 static unsigned gFill[kDevices];
@@ -69,6 +73,13 @@ static OSStatus IOProc(AudioObjectID inDevice, const AudioTimeStamp* inNow,
                 data[i + 1] = kRightAmp * (float)sin(gPhaseR);
                 gPhaseL += gPhaseIncL;
                 gPhaseR += gPhaseIncR;
+                // REQ-105: write a one-sample full-scale spike at a known
+                // output frame so the write->read delay can be measured.
+                if (gOutFrames == kSpikeFrame) {
+                    data[i + 0] = 1.0f;
+                    data[i + 1] = 1.0f;
+                }
+                gOutFrames++;
             }
         }
     }
@@ -189,6 +200,25 @@ int main(void) {
                    dev + 1, rL, rR, ok ? "OK" : "LEAK");
             if (!ok) failures++;
         }
+    }
+    // REQ-105: measure the write->read loopback delay from the full-scale
+    // spike. The sine (amplitude 0.9) never reaches the 0.99 threshold, so the
+    // first sample past it is exactly the spike; its capture index minus the
+    // spike's output frame index is the loopback latency in frames.
+    int spikeIdx = -1;
+    for (int c = (int)kSpikeFrame; c < (int)kCaptureFrames && c < (int)gFill[0]; c++) {
+        if (fabsf(gCapture[0][c * 2 + 0]) >= 0.99f) { spikeIdx = c; break; }
+    }
+    if (spikeIdx < 0) {
+        printf("check latency (REQ-105): FAIL (spike not found in capture)\n");
+        failures++;
+    } else {
+        int latency = spikeIdx - (int)kSpikeFrame;
+        double ms = latency * 1000.0 / kSampleRate;
+        int ok = latency > 0 && latency <= 1000;
+        printf("check latency (REQ-105): spike at frame %u, captured at %d -> %d frames (%.2f ms) %s\n",
+               (unsigned)kSpikeFrame, spikeIdx, latency, ms, ok ? "OK" : "OUT OF RANGE");
+        if (!ok) failures++;
     }
     if (failures) { printf("FAIL\n"); return 1; }
     printf("PASS: each device loops back to itself with no cross-device leakage\n");

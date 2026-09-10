@@ -48,7 +48,10 @@ static void MixrLogf(const char* fmt, ...) {
 #define kMixrDeviceChannels        2      // each device is stereo
 #define kMixrBoxObjectID           2
 #define kMixrFirstDeviceID         3
-#define kMixrRingFrameCount        8192
+// REQ-105: 1024 frames (4x the measured 256-frame HAL IO buffer). The read
+// position is one buffer behind the write head, so the ring size only bounds
+// the zero-timestamp period (21.3 ms at 48 kHz), not the loopback delay.
+#define kMixrRingFrameCount        1024
 #define kMixrBitsPerSample         32
 #define kMixrDeviceCount           kMixrChannelCount
 #define kMixrStreamCount           (2 * kMixrChannelCount)
