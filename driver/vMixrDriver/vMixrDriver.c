@@ -2,7 +2,9 @@
 // Implemented from Apple's public CoreAudio headers only (no BlackHole source).
 //
 // The driver presents four full-duplex stereo devices:
-//   - vMixr 1 .. vMixr 4 : each 2ch (stereo), 32-bit float, 48000 Hz
+//   - vMixr 1 .. vMixr 4 : each 2ch (stereo), 32-bit float
+// All four devices share one sample rate: 44100 / 48000 / 96000 Hz
+// (default 48000), settable per device (REQ-106).
 // Each device has one output stream and one input stream. Audio played into a
 // device's output stream is routed to the same device's input stream (loopback),
 // so an app that captures from the device hears what other apps played into it.
@@ -43,7 +45,11 @@ static void MixrLogf(const char* fmt, ...) {
 // Each device has one output stream and one input stream.
 //   device N (N=0..3): object 3+3N (device), 4+3N (out stream), 5+3N (in stream)
 //   device 0: 3,4,5    device 1: 6,7,8    device 2: 9,10,11    device 3: 12,13,14
-#define kMixrSampleRate            48000.0
+// REQ-106: the rates the devices support. All four devices share one rate
+// (default 48000 Hz); any device accepts only these three values.
+#define kMixrDefaultSampleRate     48000.0
+static const Float64 kMixrSupportedRates[3] = { 44100.0, 48000.0, 96000.0 };
+#define kMixrSupportedRateCount    3
 #define kMixrChannelCount          4      // number of devices
 #define kMixrDeviceChannels        2      // each device is stereo
 #define kMixrBoxObjectID           2
@@ -100,6 +106,11 @@ struct MixrDriver {
     bool                                  streamActive[kMixrStreamCount];
     // The HAL acquires and releases the box, so this is state, not a constant.
     bool                                  boxAcquired;
+    // REQ-106: the rate shared by all four devices. Must be one of
+    // kMixrSupportedRates; changing it updates hostTicksPerFrame and the
+    // advertised stream formats.
+    Float64                               sampleRate;
+    Float64                               hostClockFrequency;
     // Per-device timeline anchor for GetZeroTimeStamp. The HAL builds each
     // device's sample clock from these, so they advance one ring buffer at a
     // time. Indexed by device (0..3).
@@ -128,10 +139,17 @@ static MixrDriver* MixrObject(AudioServerPlugInDriverRef inDriver) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-static void MixrMakeASBD(AudioStreamBasicDescription* asbd) {
+static bool MixrRateSupported(Float64 rate) {
+    for (int i = 0; i < kMixrSupportedRateCount; i++) {
+        if (rate == kMixrSupportedRates[i]) return true;
+    }
+    return false;
+}
+
+static void MixrMakeASBD(Float64 rate, AudioStreamBasicDescription* asbd) {
     // Interleaved float32 stereo: every stream carries two channels.
     memset(asbd, 0, sizeof(*asbd));
-    asbd->mSampleRate      = kMixrSampleRate;
+    asbd->mSampleRate      = rate;
     asbd->mFormatID        = kAudioFormatLinearPCM;
     asbd->mFormatFlags     = kAudioFormatFlagsNativeEndian
                             | kAudioFormatFlagIsFloat
@@ -212,6 +230,30 @@ static AudioObjectID MixrInStreamID(int dev) {
     return (AudioObjectID)(kMixrFirstDeviceID + 3 * dev + 2);
 }
 
+// REQ-106: a rate change moves the device's rate and every stream's formats,
+// so announce all of them on every device and stream.
+static void MixrNotifySampleRateChanged(MixrDriver* obj) {
+    if (obj->host == NULL || obj->host->PropertiesChanged == NULL) return;
+    for (int dev = 0; dev < kMixrDeviceCount; dev++) {
+        AudioObjectPropertyAddress rateAddr = {
+            kAudioDevicePropertyNominalSampleRate,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain
+        };
+        obj->host->PropertiesChanged(obj->host, MixrDeviceID(dev), 1, &rateAddr);
+
+        AudioObjectPropertyAddress streamAddrs[4] = {
+            { kAudioStreamPropertyPhysicalFormat,                 kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+            { kAudioStreamPropertyVirtualFormat,                  kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+            { kAudioStreamPropertyAvailablePhysicalFormats,       kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+            { kAudioStreamPropertyAvailableVirtualFormats,        kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain }
+        };
+        obj->host->PropertiesChanged(obj->host, MixrOutStreamID(dev), 4, streamAddrs);
+        obj->host->PropertiesChanged(obj->host, MixrInStreamID(dev), 4, streamAddrs);
+    }
+    MixrLogf("rate_changed -> %.0f Hz", obj->sampleRate);
+}
+
 static void MixrDeviceNameString(int dev, char* outBuf, size_t cap) {
     snprintf(outBuf, cap, "vMixr %d", dev + 1);
 }
@@ -271,10 +313,12 @@ static OSStatus MixrInitialize(AudioServerPlugInDriverRef inDriver, AudioServerP
     obj->host = inHost;
     obj->clientCount = 0;
     obj->boxAcquired = true;
+    // REQ-106: start at the default rate; the setter moves it.
+    obj->sampleRate = kMixrDefaultSampleRate;
     struct mach_timebase_info timeBase;
     mach_timebase_info(&timeBase);
-    Float64 hostClockFrequency = ((Float64)timeBase.denom / (Float64)timeBase.numer) * 1000000000.0;
-    obj->hostTicksPerFrame = hostClockFrequency / kMixrSampleRate;
+    obj->hostClockFrequency = ((Float64)timeBase.denom / (Float64)timeBase.numer) * 1000000000.0;
+    obj->hostTicksPerFrame = obj->hostClockFrequency / obj->sampleRate;
     MixrResetRing(obj);
     MixrLogf("init pid=%d host=%p", (int)getpid(), (void*)inHost);
     // The HAL scans the plug-in's owned objects / device list after this returns,
@@ -595,14 +639,15 @@ static OSStatus MixrGetPropertyDataImpl(MixrDriver* obj, AudioObjectID objectID,
                 *outDataSize = 0;
                 return noErr;
             case kAudioDevicePropertyNominalSampleRate: {
-                Float64 rate = kMixrSampleRate;
+                // REQ-106: the rate shared by all four devices.
+                Float64 rate = obj->sampleRate;
                 *outDataSize = sizeof(Float64);
                 if (outData != NULL && inDataSize >= sizeof(Float64)) *(Float64*)outData = rate;
                 return noErr;
             }
             case kAudioDevicePropertyAvailableNominalSampleRates: {
-                Float64 rates[1] = { kMixrSampleRate };
-                MixrWriteList(rates, 1, sizeof(Float64), inDataSize, outDataSize, outData);
+                MixrWriteList(kMixrSupportedRates, kMixrSupportedRateCount,
+                             sizeof(Float64), inDataSize, outDataSize, outData);
                 return noErr;
             }
             case kAudioDevicePropertyIsHidden:
@@ -693,12 +738,12 @@ static OSStatus MixrGetPropertyDataImpl(MixrDriver* obj, AudioObjectID objectID,
                 return noErr;
             case kAudioStreamPropertyAvailablePhysicalFormats:
             case kAudioStreamPropertyAvailableVirtualFormats: {
-                // The stream runs at one fixed format, so the list has a single entry.
+                // REQ-106: float32 stereo at any of the supported rates.
                 AudioStreamRangedDescription range;
                 memset(&range, 0, sizeof(range));
-                MixrMakeASBD(&range.mFormat);
-                range.mSampleRateRange.mMinimum = kMixrSampleRate;
-                range.mSampleRateRange.mMaximum = kMixrSampleRate;
+                MixrMakeASBD(obj->sampleRate, &range.mFormat);
+                range.mSampleRateRange.mMinimum = kMixrSupportedRates[0];
+                range.mSampleRateRange.mMaximum = kMixrSupportedRates[kMixrSupportedRateCount - 1];
                 MixrWriteList(&range, 1, sizeof(range), inDataSize, outDataSize, outData);
                 return noErr;
             }
@@ -708,7 +753,7 @@ static OSStatus MixrGetPropertyDataImpl(MixrDriver* obj, AudioObjectID objectID,
             case kAudioStreamPropertyPhysicalFormat:
             case kAudioStreamPropertyVirtualFormat: {
                 AudioStreamBasicDescription asbd;
-                MixrMakeASBD(&asbd);
+                MixrMakeASBD(obj->sampleRate, &asbd);
                 *outDataSize = sizeof(asbd);
                 if (outData != NULL && inDataSize >= sizeof(asbd)) memcpy(outData, &asbd, sizeof(asbd));
                 return noErr;
@@ -848,7 +893,8 @@ static OSStatus MixrIsPropertySettable(AudioServerPlugInDriverRef inDriver, Audi
     if (outIsSettable != NULL) *outIsSettable = false;
     int index;
     MixrObjectKind kind = MixrObjectKindOf(objectID, &index);
-    // The nominal sample rate is settable on every device (single-rate device).
+    // REQ-106: the nominal sample rate is settable on every device (all four
+    // devices share the one rate).
     if (MixrIsDevice(kind) && address->mSelector == kAudioDevicePropertyNominalSampleRate) {
         if (outIsSettable != NULL) *outIsSettable = true;
     }
@@ -939,11 +985,25 @@ static OSStatus MixrSetPropertyData(AudioServerPlugInDriverRef inDriver, AudioOb
         }
     } else if (MixrIsDevice(MixrObjectKindOf(objectID, &dummyIndex))
         && address->mSelector == kAudioDevicePropertyNominalSampleRate) {
-        // Single-rate device: accept the rate it already runs at, reject anything else.
+        // REQ-106: one rate is shared by all four devices. Accept only the
+        // supported rates; anything else is rejected so the HAL never sees a
+        // "succeeded but unchanged" value (see docs/design.md).
         if (dataSize != sizeof(Float64) || data == NULL) {
             r = kAudioHardwareBadPropertySizeError;
         } else {
-            r = (*(const Float64*)data == kMixrSampleRate) ? noErr : kAudioHardwareIllegalOperationError;
+            Float64 wanted = *(const Float64*)data;
+            if (wanted == obj->sampleRate) {
+                r = noErr;
+            } else if (!MixrRateSupported(wanted)) {
+                r = kAudioHardwareIllegalOperationError;
+            } else {
+                obj->sampleRate = wanted;
+                obj->hostTicksPerFrame = obj->hostClockFrequency / wanted;
+                // In-flight audio belongs to the old rate; discard it.
+                MixrResetRing(obj);
+                MixrNotifySampleRateChanged(obj);
+                r = noErr;
+            }
         }
     } else if (MixrIsStream(MixrObjectKindOf(objectID, &dummyIndex))
                && (address->mSelector == kAudioStreamPropertyPhysicalFormat
@@ -954,7 +1014,7 @@ static OSStatus MixrSetPropertyData(AudioServerPlugInDriverRef inDriver, AudioOb
         } else {
             const AudioStreamBasicDescription* asked = (const AudioStreamBasicDescription*)data;
             AudioStreamBasicDescription mine;
-            MixrMakeASBD(&mine);
+            MixrMakeASBD(obj->sampleRate, &mine);
             r = (asked->mSampleRate == mine.mSampleRate
                  && asked->mFormatID == mine.mFormatID
                  && asked->mChannelsPerFrame == mine.mChannelsPerFrame)
@@ -1109,6 +1169,7 @@ vMixr_Create(  CFUUIDRef inFactoryUUID,
     if (obj == NULL) return NULL;
     obj->refCount = 1;
     for (uint32_t i = 0; i < kMixrStreamCount; i++) obj->streamActive[i] = true;
+    obj->sampleRate = kMixrDefaultSampleRate;
     MixrVTableInit(obj);
     if (outRefcon != NULL) *outRefcon = (UInt32)(uintptr_t)obj;
     MixrLogf("create pid=%d obj=%p", (int)getpid(), (void*)obj);

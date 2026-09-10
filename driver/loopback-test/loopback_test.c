@@ -26,9 +26,10 @@
 
 #define kDevices        4
 #define kChannels       2
-#define kSampleRate     48000.0
+#define kDefaultRate    48000.0
 #define kRunSeconds     1
-#define kCaptureFrames  (48000 * kRunSeconds)
+// Sized for the highest supported rate (REQ-106); the actual count is gCaptureFrames.
+#define kMaxCaptureFrames (96000 * kRunSeconds)
 
 // Source signal (played into vMixr 1's output, dev 0). Amplitude 0.9 is near
 // full scale, so any accidental summing shows up immediately as clipping past
@@ -44,12 +45,15 @@ static double gPhaseL;
 static double gPhaseR;
 static double gPhaseIncL;
 static double gPhaseIncR;
+// REQ-106: the rate this run uses, set from the command line (default 48000).
+static double gRate;
+static unsigned gCaptureFrames;
 // REQ-105 latency probe: total frames written to the source output, and the
 // output-frame index at which a one-sample full-scale spike is written.
 static unsigned gOutFrames;
-#define kSpikeFrame ((unsigned)(kSampleRate / 2))
+static unsigned gSpikeFrame;
 // Capture from all 4 devices' inputs (0..3).
-static float gCapture[kDevices][2 * kCaptureFrames];
+static float gCapture[kDevices][2 * kMaxCaptureFrames];
 static unsigned gFill[kDevices];
 
 static OSStatus IOProc(AudioObjectID inDevice, const AudioTimeStamp* inNow,
@@ -75,7 +79,7 @@ static OSStatus IOProc(AudioObjectID inDevice, const AudioTimeStamp* inNow,
                 gPhaseR += gPhaseIncR;
                 // REQ-105: write a one-sample full-scale spike at a known
                 // output frame so the write->read delay can be measured.
-                if (gOutFrames == kSpikeFrame) {
+                if (gOutFrames == gSpikeFrame) {
                     data[i + 0] = 1.0f;
                     data[i + 1] = 1.0f;
                 }
@@ -90,7 +94,7 @@ static OSStatus IOProc(AudioObjectID inDevice, const AudioTimeStamp* inNow,
         if (in->mData && in->mNumberChannels == kChannels) {
             const float* data = (const float*)in->mData;
             for (UInt32 i = 0; i < in->mDataByteSize / sizeof(float); i += kChannels) {
-                if (gFill[dev] < kCaptureFrames) {
+                if (gFill[dev] < gCaptureFrames) {
                     gCapture[dev][gFill[dev] * 2 + 0] = data[i + 0];
                     gCapture[dev][gFill[dev] * 2 + 1] = data[i + 1];
                     gFill[dev]++;
@@ -142,12 +146,23 @@ static void ReportRms(int dev) {
     }
     float rmsL = (float)sqrt(sumL / len);
     float rmsR = (float)sqrt(sumR / len);
-    printf("vMixr %d: L rms=%f peak=%f | R rms=%f peak=%f | fill=%d/%d\n", dev + 1, rmsL, peakL, rmsR, peakR, n, (int)kCaptureFrames);
+    printf("vMixr %d: L rms=%f peak=%f | R rms=%f peak=%f | fill=%d/%d\n", dev + 1, rmsL, peakL, rmsR, peakR, n, (int)gCaptureFrames);
 }
 
-int main(void) {
-    gPhaseIncL = 2.0 * M_PI * kLeftFreq / kSampleRate;
-    gPhaseIncR = 2.0 * M_PI * kRightFreq / kSampleRate;
+int main(int argc, char** argv) {
+    // REQ-106: accept the rate on the command line (default 48000).
+    gRate = kDefaultRate;
+    if (argc > 1) {
+        gRate = atof(argv[1]);
+        if (gRate != 44100.0 && gRate != 48000.0 && gRate != 96000.0) {
+            printf("usage: loopback_test [44100|48000|96000]\n");
+            return 1;
+        }
+    }
+    gCaptureFrames = (unsigned)(gRate * kRunSeconds);
+    gSpikeFrame = (unsigned)(gRate / 2);
+    gPhaseIncL = 2.0 * M_PI * kLeftFreq / gRate;
+    gPhaseIncR = 2.0 * M_PI * kRightFreq / gRate;
 
     bool allFound = true;
     for (int dev = 0; dev < kDevices; dev++) {
@@ -157,6 +172,20 @@ int main(void) {
         else printf("found: %s -> obj %u\n", uid, (unsigned)gDevice[dev]);
     }
     if (!allFound) { printf("FAIL: not all devices found\n"); return 1; }
+
+    // REQ-106: set every device to the requested rate and read it back.
+    for (int dev = 0; dev < kDevices; dev++) {
+        AudioObjectPropertyAddress a = { kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+        OSStatus st = AudioObjectSetPropertyData(gDevice[dev], &a, 0, NULL, sizeof(gRate), &gRate);
+        if (st != noErr) { printf("FAIL: setting rate %.0f on vMixr %d st=%d\n", gRate, dev + 1, (int)st); return 1; }
+        Float64 got = 0;
+        UInt32 gotSize = sizeof(got);
+        if (AudioObjectGetPropertyData(gDevice[dev], &a, 0, NULL, &gotSize, &got) != noErr || got != gRate) {
+            printf("FAIL: vMixr %d reports rate %.0f after setting %.0f\n", dev + 1, got, gRate);
+            return 1;
+        }
+    }
+    printf("using sample rate %.0f Hz\n", gRate);
 
     // Start all devices (one callback per device sees both output and input).
     // AudioDeviceStart takes an AudioDeviceIOProcID, not a raw function
@@ -206,18 +235,18 @@ int main(void) {
     // first sample past it is exactly the spike; its capture index minus the
     // spike's output frame index is the loopback latency in frames.
     int spikeIdx = -1;
-    for (int c = (int)kSpikeFrame; c < (int)kCaptureFrames && c < (int)gFill[0]; c++) {
+    for (int c = (int)gSpikeFrame; c < (int)gCaptureFrames && c < (int)gFill[0]; c++) {
         if (fabsf(gCapture[0][c * 2 + 0]) >= 0.99f) { spikeIdx = c; break; }
     }
     if (spikeIdx < 0) {
         printf("check latency (REQ-105): FAIL (spike not found in capture)\n");
         failures++;
     } else {
-        int latency = spikeIdx - (int)kSpikeFrame;
-        double ms = latency * 1000.0 / kSampleRate;
+        int latency = spikeIdx - (int)gSpikeFrame;
+        double ms = latency * 1000.0 / gRate;
         int ok = latency > 0 && latency <= 1000;
         printf("check latency (REQ-105): spike at frame %u, captured at %d -> %d frames (%.2f ms) %s\n",
-               (unsigned)kSpikeFrame, spikeIdx, latency, ms, ok ? "OK" : "OUT OF RANGE");
+               (unsigned)gSpikeFrame, spikeIdx, latency, ms, ok ? "OK" : "OUT OF RANGE");
         if (!ok) failures++;
     }
     if (failures) { printf("FAIL\n"); return 1; }
