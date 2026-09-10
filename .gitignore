@@ -5,6 +5,7 @@ driver/loopback-test/loopback_test
 driver/loopback-test/list_devices
 driver/loopback-test/defdev
 driver/loopback-test/setdefault
+driver/loopback-test/volume_test
 
 # Xcode / build detritus
 build/

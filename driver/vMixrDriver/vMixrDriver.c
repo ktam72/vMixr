@@ -45,6 +45,16 @@ static void MixrLogf(const char* fmt, ...) {
 // Each device has one output stream and one input stream.
 //   device N (N=0..3): object 3+3N (device), 4+3N (out stream), 5+3N (in stream)
 //   device 0: 3,4,5    device 1: 6,7,8    device 2: 9,10,11    device 3: 12,13,14
+// REQ-107: volume and mute are exposed as Control objects (the modern HAL
+// model; the built-in device presents the same structure). Eight control
+// objects per device (15+8N..22+8N):
+//   role 0..2 : output volume control (main / left / right)
+//   role 3    : output mute control
+//   role 4..6 : input volume control (main / left / right)
+//   role 7    : input mute control
+// A control's element (celm) is 0 (main), 1 (left) or 2 (right).
+#define kMixrFirstControlID      15
+#define kMixrControlsPerDevice   8
 // REQ-106: the rates the devices support. All four devices share one rate
 // (default 48000 Hz); any device accepts only these three values.
 #define kMixrDefaultSampleRate     48000.0
@@ -129,6 +139,16 @@ struct MixrDriver {
     // Index: D * (2 * R) + C * R + position. ringHead[D] is D's next write pos.
     float                                 ringBuffer[kMixrChannelCount * kMixrDeviceChannels * kMixrRingFrameCount];
     uint32_t                              ringHead[kMixrChannelCount];
+    // REQ-107: per-device volume (default 1.0) and per-scope mute. Index 0 is
+    // the main (whole-device) volume, index 1 the left channel, index 2 the
+    // right channel. The effective gain of output channel c is
+    // outVolume[d][0] * outVolume[d][c+1], applied before the ring write, so
+    // the loopback capture is attenuated too. The input gain
+    // inVolume[d][0] * inVolume[d][c+1] is applied at capture time.
+    float                                 outVolume[kMixrChannelCount][3];
+    float                                 inVolume[kMixrChannelCount][3];
+    bool                                  outMuted[kMixrChannelCount];
+    bool                                  inMuted[kMixrChannelCount];
 };
 typedef struct MixrDriver MixrDriver;
 
@@ -182,13 +202,22 @@ typedef enum {
     MixrKind_Box,
     MixrKind_Device,
     MixrKind_StreamOut,
-    MixrKind_StreamIn
+    MixrKind_StreamIn,
+    MixrKind_Control
 } MixrObjectKind;
 
 static MixrObjectKind MixrObjectKindOf(AudioObjectID id, int* outDevice) {
     *outDevice = -1;
     if (id == kAudioObjectPlugInObject) return MixrKind_Plugin;
     if (id == kMixrBoxObjectID)         return MixrKind_Box;
+    if (id >= kMixrFirstControlID) {
+        uint32_t offset = id - kMixrFirstControlID;
+        if (offset < kMixrChannelCount * kMixrControlsPerDevice) {
+            *outDevice = (int)(offset / kMixrControlsPerDevice);
+            return MixrKind_Control;
+        }
+        return MixrKind_Unknown;
+    }
     if (id >= kMixrFirstDeviceID) {
         uint32_t offset = id - kMixrFirstDeviceID;
         uint32_t dev = offset / 3;
@@ -201,6 +230,28 @@ static MixrObjectKind MixrObjectKindOf(AudioObjectID id, int* outDevice) {
         }
     }
     return MixrKind_Unknown;
+}
+
+// REQ-107: control object helpers.
+static uint32_t MixrControlRole(AudioObjectID id) {
+    return (uint32_t)(id - kMixrFirstControlID) % kMixrControlsPerDevice;
+}
+
+static AudioObjectID MixrControlID(int dev, uint32_t role) {
+    return (AudioObjectID)(kMixrFirstControlID + kMixrControlsPerDevice * dev + role);
+}
+
+static bool MixrControlIsMute(uint32_t role) {
+    return role == 3 || role == 7;
+}
+
+static bool MixrControlIsInput(uint32_t role) {
+    return role >= 4;
+}
+
+// Volume roles (0, 1, 2, 4, 5, 6) carry the element: 0 (main), 1 (left), 2 (right).
+static uint32_t MixrControlElement(uint32_t role) {
+    return MixrControlIsMute(role) ? 0u : (role % 3);
 }
 
 // The stream slot (index into streamActive): device D out = 2D, in = 2D+1.
@@ -252,6 +303,45 @@ static void MixrNotifySampleRateChanged(MixrDriver* obj) {
         obj->host->PropertiesChanged(obj->host, MixrInStreamID(dev), 4, streamAddrs);
     }
     MixrLogf("rate_changed -> %.0f Hz", obj->sampleRate);
+}
+
+// REQ-107: announce a volume change on both the device (the client-side
+// property) and the control object that implements it.
+static void MixrNotifyVolumeChanged(MixrDriver* obj, int dev, bool isInput, uint32_t element) {
+    if (obj->host == NULL || obj->host->PropertiesChanged == NULL) return;
+    AudioObjectPropertyScope scope = isInput ? kAudioObjectPropertyScopeInput : kAudioObjectPropertyScopeOutput;
+    AudioObjectPropertyAddress deviceAddr = {
+        kAudioDevicePropertyVolumeScalar,
+        scope,
+        (AudioObjectPropertyElement)element
+    };
+    obj->host->PropertiesChanged(obj->host, MixrDeviceID(dev), 1, &deviceAddr);
+    AudioObjectPropertyAddress controlAddr = {
+        kAudioLevelControlPropertyScalarValue,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    obj->host->PropertiesChanged(obj->host, MixrControlID(dev, (isInput ? 4u : 0u) + element), 1, &controlAddr);
+    MixrLogf("volume_changed dev=%d scope=%s element=%u", dev, isInput ? "in" : "out", (unsigned)element);
+}
+
+// REQ-107: announce a mute change on both the device and the mute control.
+static void MixrNotifyMuteChanged(MixrDriver* obj, int dev, bool isInput) {
+    if (obj->host == NULL || obj->host->PropertiesChanged == NULL) return;
+    AudioObjectPropertyScope scope = isInput ? kAudioObjectPropertyScopeInput : kAudioObjectPropertyScopeOutput;
+    AudioObjectPropertyAddress deviceAddr = {
+        kAudioDevicePropertyMute,
+        scope,
+        kAudioObjectPropertyElementMain
+    };
+    obj->host->PropertiesChanged(obj->host, MixrDeviceID(dev), 1, &deviceAddr);
+    AudioObjectPropertyAddress controlAddr = {
+        kAudioBooleanControlPropertyValue,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    obj->host->PropertiesChanged(obj->host, MixrControlID(dev, (isInput ? 7u : 3u)), 1, &controlAddr);
+    MixrLogf("mute_changed dev=%d scope=%s", dev, isInput ? "in" : "out");
 }
 
 static void MixrDeviceNameString(int dev, char* outBuf, size_t cap) {
@@ -315,6 +405,17 @@ static OSStatus MixrInitialize(AudioServerPlugInDriverRef inDriver, AudioServerP
     obj->boxAcquired = true;
     // REQ-106: start at the default rate; the setter moves it.
     obj->sampleRate = kMixrDefaultSampleRate;
+    // REQ-107: full gain, not muted.
+    for (int d = 0; d < kMixrDeviceCount; d++) {
+        obj->outVolume[d][0] = 1.0f;
+        obj->outVolume[d][1] = 1.0f;
+        obj->outVolume[d][2] = 1.0f;
+        obj->inVolume[d][0]  = 1.0f;
+        obj->inVolume[d][1]  = 1.0f;
+        obj->inVolume[d][2]  = 1.0f;
+        obj->outMuted[d] = false;
+        obj->inMuted[d]  = false;
+    }
     struct mach_timebase_info timeBase;
     mach_timebase_info(&timeBase);
     obj->hostClockFrequency = ((Float64)timeBase.denom / (Float64)timeBase.numer) * 1000000000.0;
@@ -596,10 +697,16 @@ static OSStatus MixrGetPropertyDataImpl(MixrDriver* obj, AudioObjectID objectID,
             case kAudioObjectPropertyManufacturer:
                 MixrWriteCFStr(kMixrNameCString, inDataSize, outDataSize, outData);
                 return noErr;
-            case kAudioObjectPropertyOwnedObjects:
-                // Both streams (out and in) belong to the device.
-                MixrWriteDeviceStreams(objectID, kAudioObjectPropertyScopeGlobal, inDataSize, outDataSize, outData);
+            case kAudioObjectPropertyOwnedObjects: {
+                // Both streams and the eight controls belong to the device.
+                AudioObjectID items[2 + kMixrControlsPerDevice];
+                uint32_t n = 0;
+                items[n++] = MixrOutStreamID(index);
+                items[n++] = MixrInStreamID(index);
+                for (uint32_t i = 0; i < kMixrControlsPerDevice; i++) items[n++] = MixrControlID(index, i);
+                MixrWriteList(items, n, sizeof(AudioObjectID), inDataSize, outDataSize, outData);
                 return noErr;
+            }
             case kAudioDevicePropertyDeviceUID:
                 MixrWriteCFStr(uidBuf, inDataSize, outDataSize, outData);
                 return noErr;
@@ -635,9 +742,44 @@ static OSStatus MixrGetPropertyDataImpl(MixrDriver* obj, AudioObjectID objectID,
             case kAudioDevicePropertyLatency:
                 MixrWriteU32(0, inDataSize, outDataSize, outData);
                 return noErr;
-            case kAudioObjectPropertyControlList:
-                *outDataSize = 0;
+            case kAudioDevicePropertyMute: {
+                // REQ-107: scope-specific mute (output or input).
+                if (scope != kAudioObjectPropertyScopeOutput && scope != kAudioObjectPropertyScopeInput) {
+                    *outDataSize = 0;
+                    return kAudioHardwareIllegalOperationError;
+                }
+                bool muted = (scope == kAudioObjectPropertyScopeOutput) ? obj->outMuted[index] : obj->inMuted[index];
+                MixrWriteU32(muted ? 1 : 0, inDataSize, outDataSize, outData);
                 return noErr;
+            }
+            case kAudioObjectPropertyControlList: {
+                // REQ-107: list the device's volume and mute controls. The
+                // modern HAL derives the client-side volume/mute properties
+                // from this list (the built-in device presents the same shape,
+                // and returns the same list for every scope).
+                AudioObjectID items[kMixrControlsPerDevice];
+                for (uint32_t i = 0; i < kMixrControlsPerDevice; i++) items[i] = MixrControlID(index, i);
+                MixrWriteList(items, kMixrControlsPerDevice, sizeof(AudioObjectID), inDataSize, outDataSize, outData);
+                return noErr;
+            }
+            case kAudioDevicePropertyVolumeScalar: {
+                // REQ-107: the modern client addresses per-channel volume as
+                // device scope plus element: main (0) for the whole-device
+                // volume, 1 (left) and 2 (right) for the channel volumes.
+                if (scope != kAudioObjectPropertyScopeOutput && scope != kAudioObjectPropertyScopeInput) {
+                    *outDataSize = 0;
+                    return kAudioHardwareIllegalOperationError;
+                }
+                if (address->mElement > 2) {
+                    *outDataSize = 0;
+                    return kAudioHardwareUnknownPropertyError;
+                }
+                const float* vols = (scope == kAudioObjectPropertyScopeOutput) ? obj->outVolume[index] : obj->inVolume[index];
+                Float32 v = vols[address->mElement];
+                *outDataSize = sizeof(Float32);
+                if (outData != NULL && inDataSize >= sizeof(Float32)) *(Float32*)outData = v;
+                return noErr;
+            }
             case kAudioDevicePropertyNominalSampleRate: {
                 // REQ-106: the rate shared by all four devices.
                 Float64 rate = obj->sampleRate;
@@ -767,6 +909,64 @@ static OSStatus MixrGetPropertyDataImpl(MixrDriver* obj, AudioObjectID objectID,
         }
     }
 
+    // REQ-107: a Control object (the modern HAL model). The device's volume
+    // and mute are implemented by these objects, and the client-side device
+    // volume/mute properties are reachable because they are listed in the
+    // device's ControlList.
+    if (kind == MixrKind_Control) {
+        uint32_t role = MixrControlRole(objectID);
+        bool isMute = MixrControlIsMute(role);
+        bool isInput = MixrControlIsInput(role);
+        uint32_t element = MixrControlElement(role);
+        char nameBuf[32];
+        const char* side = isInput ? "Input" : "Output";
+        const char* what = isMute ? "Mute"
+            : (element == 0) ? "Volume"
+            : (element == 1) ? "Volume Left"
+            : "Volume Right";
+        snprintf(nameBuf, sizeof(nameBuf), "%s %s", side, what);
+        switch (selector) {
+            case kAudioObjectPropertyBaseClass:
+                MixrWriteClass(isMute ? kAudioBooleanControlClassID : kAudioLevelControlClassID, inDataSize, outDataSize, outData);
+                return noErr;
+            case kAudioObjectPropertyClass:
+                MixrWriteClass(isMute ? kAudioMuteControlClassID : kAudioVolumeControlClassID, inDataSize, outDataSize, outData);
+                return noErr;
+            case kAudioObjectPropertyOwner:
+                MixrWriteObjID(MixrDeviceID(index), inDataSize, outDataSize, outData);
+                return noErr;
+            case kAudioObjectPropertyManufacturer:
+                MixrWriteCFStr(kMixrNameCString, inDataSize, outDataSize, outData);
+                return noErr;
+            case kAudioObjectPropertyName:
+            case kAudioObjectPropertyElementName:
+                MixrWriteCFStr(nameBuf, inDataSize, outDataSize, outData);
+                return noErr;
+            case kAudioControlPropertyScope:
+                MixrWriteU32(isInput ? kAudioObjectPropertyScopeInput : kAudioObjectPropertyScopeOutput, inDataSize, outDataSize, outData);
+                return noErr;
+            case kAudioControlPropertyElement:
+                MixrWriteU32(element, inDataSize, outDataSize, outData);
+                return noErr;
+            case kAudioLevelControlPropertyScalarValue: {
+                if (isMute) break;
+                const float* vols = isInput ? obj->inVolume[index] : obj->outVolume[index];
+                Float32 v = vols[element];
+                *outDataSize = sizeof(Float32);
+                if (outData != NULL && inDataSize >= sizeof(Float32)) *(Float32*)outData = v;
+                return noErr;
+            }
+            case kAudioBooleanControlPropertyValue: {
+                if (!isMute) break;
+                bool muted = isInput ? obj->inMuted[index] : obj->outMuted[index];
+                MixrWriteU32(muted ? 1 : 0, inDataSize, outDataSize, outData);
+                return noErr;
+            }
+            default:
+                break;
+        }
+    }
+
     *outDataSize = 0;
     return kAudioHardwareUnknownPropertyError;
 }
@@ -841,7 +1041,9 @@ static Boolean MixrHasPropertyImpl(MixrDriver* obj, AudioObjectID objectID, cons
             case kAudioDevicePropertyDeviceCanBeDefaultDevice:
             case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice:
             case kAudioDevicePropertyLatency:
+            case kAudioDevicePropertyMute:
             case kAudioObjectPropertyControlList:
+            case kAudioDevicePropertyVolumeScalar:
             case kAudioDevicePropertyNominalSampleRate:
             case kAudioDevicePropertyAvailableNominalSampleRates:
             case kAudioDevicePropertyIsHidden:
@@ -877,6 +1079,29 @@ static Boolean MixrHasPropertyImpl(MixrDriver* obj, AudioObjectID objectID, cons
                 break;
         }
     }
+    // REQ-107: Control objects expose their class identity, scope, element,
+    // and value. Volume controls carry the scalar value; mute controls carry
+    // the boolean value.
+    if (kind == MixrKind_Control) {
+        uint32_t role = MixrControlRole(objectID);
+        switch (selector) {
+            case kAudioObjectPropertyBaseClass:
+            case kAudioObjectPropertyClass:
+            case kAudioObjectPropertyOwner:
+            case kAudioObjectPropertyManufacturer:
+            case kAudioObjectPropertyName:
+            case kAudioObjectPropertyElementName:
+            case kAudioControlPropertyScope:
+            case kAudioControlPropertyElement:
+                return true;
+            case kAudioLevelControlPropertyScalarValue:
+                return !MixrControlIsMute(role);
+            case kAudioBooleanControlPropertyValue:
+                return MixrControlIsMute(role);
+            default:
+                break;
+        }
+    }
     return false;
 }
 
@@ -897,6 +1122,25 @@ static OSStatus MixrIsPropertySettable(AudioServerPlugInDriverRef inDriver, Audi
     // devices share the one rate).
     if (MixrIsDevice(kind) && address->mSelector == kAudioDevicePropertyNominalSampleRate) {
         if (outIsSettable != NULL) *outIsSettable = true;
+    }
+    // REQ-107: the scope-specific mute is settable on every device.
+    if (MixrIsDevice(kind) && address->mSelector == kAudioDevicePropertyMute
+        && (address->mScope == kAudioObjectPropertyScopeOutput || address->mScope == kAudioObjectPropertyScopeInput)) {
+        if (outIsSettable != NULL) *outIsSettable = true;
+    }
+    // REQ-107: the scope-specific, element-addressed volume is settable.
+    if (MixrIsDevice(kind) && address->mSelector == kAudioDevicePropertyVolumeScalar
+        && (address->mScope == kAudioObjectPropertyScopeOutput || address->mScope == kAudioObjectPropertyScopeInput)
+        && address->mElement <= 2) {
+        if (outIsSettable != NULL) *outIsSettable = true;
+    }
+    // REQ-107: Control objects are settable through their value selector.
+    if (kind == MixrKind_Control) {
+        uint32_t role = MixrControlRole(objectID);
+        if ((MixrControlIsMute(role) && address->mSelector == kAudioBooleanControlPropertyValue)
+            || (!MixrControlIsMute(role) && address->mSelector == kAudioLevelControlPropertyScalarValue)) {
+            if (outIsSettable != NULL) *outIsSettable = true;
+        }
     }
     if (kind == MixrKind_Box && address->mSelector == kAudioBoxPropertyAcquired) {
         if (outIsSettable != NULL) *outIsSettable = true;
@@ -1005,6 +1249,79 @@ static OSStatus MixrSetPropertyData(AudioServerPlugInDriverRef inDriver, AudioOb
                 r = noErr;
             }
         }
+    } else if (MixrIsDevice(MixrObjectKindOf(objectID, &dummyIndex))
+        && address->mSelector == kAudioDevicePropertyMute) {
+        // REQ-107: scope-specific mute (output or input).
+        if (address->mScope != kAudioObjectPropertyScopeOutput && address->mScope != kAudioObjectPropertyScopeInput) {
+            r = kAudioHardwareIllegalOperationError;
+        } else if (dataSize != sizeof(UInt32) || data == NULL) {
+            r = kAudioHardwareBadPropertySizeError;
+        } else {
+            bool wanted = (*(const UInt32*)data != 0);
+            bool* flag = (address->mScope == kAudioObjectPropertyScopeOutput) ? &obj->outMuted[dummyIndex] : &obj->inMuted[dummyIndex];
+            if (*flag != wanted) {
+                *flag = wanted;
+                MixrNotifyMuteChanged(obj, dummyIndex, address->mScope == kAudioObjectPropertyScopeInput);
+            }
+            r = noErr;
+        }
+    } else if (MixrIsDevice(MixrObjectKindOf(objectID, &dummyIndex))
+        && address->mSelector == kAudioDevicePropertyVolumeScalar) {
+        // REQ-107: the modern client addresses the volume by device scope plus
+        // element (0=main, 1=left, 2=right) as a single Float32.
+        if (address->mScope != kAudioObjectPropertyScopeOutput && address->mScope != kAudioObjectPropertyScopeInput) {
+            r = kAudioHardwareIllegalOperationError;
+        } else if (dataSize != sizeof(Float32) || data == NULL) {
+            r = kAudioHardwareBadPropertySizeError;
+        } else if (address->mElement > 2) {
+            r = kAudioHardwareUnknownPropertyError;
+        } else {
+            bool isInput = (address->mScope == kAudioObjectPropertyScopeInput);
+            float* vols = isInput ? obj->inVolume[dummyIndex] : obj->outVolume[dummyIndex];
+            uint32_t element = address->mElement;
+            float wanted = *(const Float32*)data;
+            if (vols[element] != wanted) {
+                vols[element] = wanted;
+                MixrNotifyVolumeChanged(obj, dummyIndex, isInput, element);
+            }
+            r = noErr;
+        }
+    } else if (MixrObjectKindOf(objectID, &dummyIndex) == MixrKind_Control
+        && (address->mSelector == kAudioLevelControlPropertyScalarValue
+            || address->mSelector == kAudioBooleanControlPropertyValue)) {
+        // REQ-107: a Control object's value, set through its own selector.
+        uint32_t role = MixrControlRole(objectID);
+        bool isInput = MixrControlIsInput(role);
+        if (MixrControlIsMute(role)) {
+            if (address->mSelector != kAudioBooleanControlPropertyValue) {
+                r = kAudioHardwareUnknownPropertyError;
+            } else if (dataSize != sizeof(UInt32) || data == NULL) {
+                r = kAudioHardwareBadPropertySizeError;
+            } else {
+                bool wanted = (*(const UInt32*)data != 0);
+                bool* flag = isInput ? &obj->inMuted[dummyIndex] : &obj->outMuted[dummyIndex];
+                if (*flag != wanted) {
+                    *flag = wanted;
+                    MixrNotifyMuteChanged(obj, dummyIndex, isInput);
+                }
+                r = noErr;
+            }
+        } else {
+            if (address->mSelector != kAudioLevelControlPropertyScalarValue) {
+                r = kAudioHardwareUnknownPropertyError;
+            } else if (dataSize != sizeof(Float32) || data == NULL) {
+                r = kAudioHardwareBadPropertySizeError;
+            } else {
+                float* vols = isInput ? obj->inVolume[dummyIndex] : obj->outVolume[dummyIndex];
+                uint32_t element = MixrControlElement(role);
+                float wanted = *(const Float32*)data;
+                if (vols[element] != wanted) {
+                    vols[element] = wanted;
+                    MixrNotifyVolumeChanged(obj, dummyIndex, isInput, element);
+                }
+                r = noErr;
+            }
+        }
     } else if (MixrIsStream(MixrObjectKindOf(objectID, &dummyIndex))
                && (address->mSelector == kAudioStreamPropertyPhysicalFormat
                    || address->mSelector == kAudioStreamPropertyVirtualFormat)) {
@@ -1098,13 +1415,28 @@ static OSStatus MixrDoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObje
     const uint32_t chCount = kMixrDeviceChannels;
     const uint32_t R = kMixrRingFrameCount;
     obj->ioCycles++;
+    // REQ-107: per-channel gain, 0 while muted. Plain float reads are safe
+    // from the property path (tearing only matters across a whole buffer,
+    // which cannot happen here).
+    // The main volume (index 0) multiplies the channel volume (index 1=left,
+    // index 2=right).
+    const float outGain[2] = {
+        obj->outMuted[dev] ? 0.0f : obj->outVolume[dev][0] * obj->outVolume[dev][1],
+        obj->outMuted[dev] ? 0.0f : obj->outVolume[dev][0] * obj->outVolume[dev][2]
+    };
+    const float inGain[2] = {
+        obj->inMuted[dev] ? 0.0f : obj->inVolume[dev][0] * obj->inVolume[dev][1],
+        obj->inMuted[dev] ? 0.0f : obj->inVolume[dev][0] * obj->inVolume[dev][2]
+    };
     if (operationID == kAudioServerPlugInIOOperationWriteMix) {
         // out stream: interleaved stereo -> this device's own ring. Overwrite
-        // at the write position and advance it (single writer per ring).
+        // at the write position and advance it (single writer per ring). The
+        // output volume is applied before the ring write, so the loopback
+        // capture is attenuated too (REQ-107).
         for (uint32_t f = 0; f < frames; f++) {
             uint32_t pos = obj->ringHead[dev];
             for (uint32_t c = 0; c < chCount; c++) {
-                obj->ringBuffer[(dev * chCount + c) * R + pos] = buffer[f * chCount + c];
+                obj->ringBuffer[(dev * chCount + c) * R + pos] = buffer[f * chCount + c] * outGain[c];
             }
             obj->ringHead[dev] = (obj->ringHead[dev] + 1) % R;
         }
@@ -1114,11 +1446,12 @@ static OSStatus MixrDoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObje
         // buffer behind the write position. Summing every device's ring here
         // would put a device's output back on its own input, which closes a
         // feedback loop as soon as a mixer app reads that input. Cross-device
-        // routing is the mixer app's job, not the driver's.
+        // routing is the mixer app's job, not the driver's. The input volume
+        // is applied at capture time (REQ-107).
         for (uint32_t f = 0; f < frames; f++) {
             uint32_t pos = (obj->ringHead[dev] + R - frames + f) % R;
             for (uint32_t c = 0; c < chCount; c++) {
-                buffer[f * chCount + c] = obj->ringBuffer[(dev * chCount + c) * R + pos];
+                buffer[f * chCount + c] = obj->ringBuffer[(dev * chCount + c) * R + pos] * inGain[c];
             }
         }
         obj->ioFramesRead += frames;
@@ -1170,6 +1503,15 @@ vMixr_Create(  CFUUIDRef inFactoryUUID,
     obj->refCount = 1;
     for (uint32_t i = 0; i < kMixrStreamCount; i++) obj->streamActive[i] = true;
     obj->sampleRate = kMixrDefaultSampleRate;
+    // REQ-107: calloc zeroes the volume state, which would mean full mute.
+    for (int d = 0; d < kMixrDeviceCount; d++) {
+        obj->outVolume[d][0] = 1.0f;
+        obj->outVolume[d][1] = 1.0f;
+        obj->outVolume[d][2] = 1.0f;
+        obj->inVolume[d][0]  = 1.0f;
+        obj->inVolume[d][1]  = 1.0f;
+        obj->inVolume[d][2]  = 1.0f;
+    }
     MixrVTableInit(obj);
     if (outRefcon != NULL) *outRefcon = (UInt32)(uintptr_t)obj;
     MixrLogf("create pid=%d obj=%p", (int)getpid(), (void*)obj);
