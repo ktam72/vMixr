@@ -1,9 +1,9 @@
-# Mixr
+# vMixr
 
 macOS で「アプリの音声を画面収録やビデオ会議に載せる」ための仮想オーディオデバイス。
 
 macOS の画面収録はマイク入力しか録音できないため、再生中の音をそのまま録画に含める
-ことができない。Mixr は 4 台の仮想オーディオデバイス（vMixr 1〜4）を提供し、
+ことができない。vMixr は 4 台の仮想オーディオデバイス（vMixr 1〜4）を提供し、
 ミキサーアプリと組み合わせてこれを実現する。
 
 ```
@@ -34,7 +34,7 @@ cd vMixr
 zsh driver/build.sh
 ```
 
-`driver/Mixr.driver` が生成される。
+`driver/vMixr.driver` が生成される。
 
 ### 2. ドライバをインストールする
 
@@ -42,8 +42,8 @@ zsh driver/build.sh
 一度止まり、起動中のオーディオアプリは再起動が必要になる**。
 
 ```bash
-sudo rm -rf /Library/Audio/Plug-Ins/HAL/Mixr.driver
-sudo cp -R driver/Mixr.driver /Library/Audio/Plug-Ins/HAL/
+sudo rm -rf /Library/Audio/Plug-Ins/HAL/vMixr.driver
+sudo cp -R driver/vMixr.driver /Library/Audio/Plug-Ins/HAL/
 sudo killall coreaudiod
 ```
 
@@ -108,7 +108,7 @@ driver/loopback-test/defdev         # 現在の既定入出力デバイス
 ## アンインストール
 
 ```bash
-sudo rm -rf /Library/Audio/Plug-Ins/HAL/Mixr.driver
+sudo rm -rf /Library/Audio/Plug-Ins/HAL/vMixr.driver
 sudo killall coreaudiod
 ```
 
@@ -138,7 +138,7 @@ LadioCast が許可されているか確認する（仮想デバイスの入力�
 **サウンド設定に vMixr が出ない**
 
 ```bash
-ls -d /Library/Audio/Plug-Ins/HAL/Mixr.driver   # 配置されているか
+ls -d /Library/Audio/Plug-Ins/HAL/vMixr.driver   # 配置されているか
 sudo killall coreaudiod                          # 再読み込み
 ```
 

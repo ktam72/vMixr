@@ -5,13 +5,13 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleExecutable</key>
-	<string>Mixr</string>
+	<string>vMixr</string>
 	<key>CFBundleIdentifier</key>
-	<string>mixr.audio.mixr</string>
+	<string>audio.vmixr.driver</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>Mixr</string>
+	<string>vMixr</string>
 	<key>CFBundlePackageType</key>
 	<string>BNDL</string>
 	<key>CFBundleShortVersionString</key>
@@ -27,7 +27,7 @@
 	<key>CFPlugInFactories</key>
 	<dict>
 		<key>A1B2C3D4-E5F6-4A7B-8C9D-0E1F2A3B4C5D</key>
-		<string>Mixr_Create</string>
+		<string>vMixr_Create</string>
 	</dict>
 	<key>CFPlugInTypes</key>
 	<dict>

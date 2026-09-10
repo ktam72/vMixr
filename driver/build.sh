@@ -4,11 +4,11 @@ set -euo pipefail
 # Resolve everything from this script's directory so the repo can live anywhere.
 cd "$(dirname "$0")"
 ROOT="$PWD"
-SRC="$ROOT/MixrDriver"
-BUNDLE="$ROOT/Mixr.driver"
+SRC="$ROOT/vMixrDriver"
+BUNDLE="$ROOT/vMixr.driver"
 
 # Fresh bundle with the standard CFBundle layout the audio HAL requires:
-#   Mixr.driver/Contents/{Info.plist, MacOS/Mixr, Resources/}
+#   vMixr.driver/Contents/{Info.plist, MacOS/vMixr, Resources/}
 rm -rf "$BUNDLE"
 mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
 
@@ -21,8 +21,8 @@ clang \
   -fno-exceptions \
   -framework CoreFoundation \
   -framework CoreAudio \
-  -o "$BUNDLE/Contents/MacOS/Mixr" \
-  "$SRC/MixrDriver.c"
+  -o "$BUNDLE/Contents/MacOS/vMixr" \
+  "$SRC/vMixrDriver.c"
 
 cp "$SRC/Info.plist" "$BUNDLE/Contents/Info.plist"
 
@@ -30,8 +30,8 @@ cp "$SRC/Info.plist" "$BUNDLE/Contents/Info.plist"
 codesign --force --sign - "$BUNDLE" 2>/dev/null || echo "(codesign skipped)"
 
 echo "built bundle: $BUNDLE"
-file "$BUNDLE/Contents/MacOS/Mixr"
-echo "--- exported symbols (Mixr_Create) ---"
-nm -gU "$BUNDLE/Contents/MacOS/Mixr" | grep -i mixr || echo "(no Mixr symbols found)"
+file "$BUNDLE/Contents/MacOS/vMixr"
+echo "--- exported symbols (vMixr_Create) ---"
+nm -gU "$BUNDLE/Contents/MacOS/vMixr" | grep -i mixr || echo "(no vMixr symbols found)"
 echo "--- bundle layout ---"
 ls -la "$BUNDLE/Contents"

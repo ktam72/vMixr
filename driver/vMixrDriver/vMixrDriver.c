@@ -1097,7 +1097,7 @@ static void MixrVTableInit(MixrDriver* obj) {
 }
 
 void*
-Mixr_Create(  CFUUIDRef inFactoryUUID,
+vMixr_Create(  CFUUIDRef inFactoryUUID,
               CFMutableDictionaryRef inModuleInfo,
               CFDictionaryRef inPlugInInfo,
               UInt32* outRefcon) {
