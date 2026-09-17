@@ -20,3 +20,5 @@ driver/build-nullaudio.sh
 
 # Internal requirements and design notes, kept locally.
 docs/
+driver/loopback-test/glitch_test
+driver/loopback-test/incap

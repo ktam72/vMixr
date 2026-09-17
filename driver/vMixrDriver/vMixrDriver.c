@@ -39,6 +39,15 @@ static void MixrLogf(const char* fmt, ...) {
     }
 }
 
+// Per-property logging is off by default: the HAL queries properties constantly,
+// and logging every query both bloats /tmp/mixr_driver.log and risks file I/O in
+// the IO path. Enable it by creating /tmp/mixr_verbose before coreaudiod starts.
+static bool MixrVerbose(void) {
+    static int sCached = -1;
+    if (sCached < 0) sCached = (access("/tmp/mixr_verbose", F_OK) == 0) ? 1 : 0;
+    return sCached != 0;
+}
+
 // Object model: one plug-in, one box, and four full-duplex stereo devices.
 // Each device has one output stream and one input stream.
 //   device N (N=0..3): object 3+3N (device), 4+3N (out stream), 5+3N (in stream)
@@ -112,9 +121,11 @@ struct MixrDriver {
     // holding its own output. Device D's input is its OWN ring (self loopback),
     // so audio sent to D's output appears on D's own input. Cross-device
     // routing is left to the host mixer app.
-    // Index: D * (2 * R) + C * R + position. ringHead[D] is D's next write pos.
+    // Index: D * (2 * R) + C * R + (sampleTime % R). Positions come from the
+    // HAL's per-cycle sample times, never from driver-side counters: the writer
+    // (playback client) and reader (capture client) run on separate IO cycles,
+    // so a shared head pointer drifts between them by their phase difference.
     float                                 ringBuffer[kMixrChannelCount * kMixrDeviceChannels * kMixrRingFrameCount];
-    uint32_t                              ringHead[kMixrChannelCount];
 };
 typedef struct MixrDriver MixrDriver;
 
@@ -148,7 +159,6 @@ static bool MixrIsDeviceUUID(REFIID inUUID) {
 
 static void MixrResetRing(MixrDriver* obj) {
     memset(obj->ringBuffer, 0, sizeof(obj->ringBuffer));
-    for (uint32_t d = 0; d < kMixrChannelCount; d++) obj->ringHead[d] = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -836,7 +846,7 @@ static Boolean MixrHasProperty(AudioServerPlugInDriverRef inDriver, AudioObjectI
     MixrDriver* obj = MixrObject(inDriver);
     (void)clientPID;
     Boolean r = MixrHasPropertyImpl(obj, objectID, address);
-    MixrLogf("hasproperty obj=%u sel=%.4s/%08x sc=%.4s/%08x el=%u r=%d", (unsigned)objectID, (const char*)&address->mSelector, (unsigned)address->mSelector, (const char*)&address->mScope, (unsigned)address->mScope, (unsigned)address->mElement, (int)r);
+    if (MixrVerbose()) MixrLogf("hasproperty obj=%u sel=%.4s/%08x sc=%.4s/%08x el=%u r=%d", (unsigned)objectID, (const char*)&address->mSelector, (unsigned)address->mSelector, (const char*)&address->mScope, (unsigned)address->mScope, (unsigned)address->mElement, (int)r);
     return r;
 }
 
@@ -863,7 +873,7 @@ static OSStatus MixrIsPropertySettable(AudioServerPlugInDriverRef inDriver, Audi
                 break;
         }
     }
-    MixrLogf("issettable obj=%u sel=%.4s/%08x sc=%.4s/%08x el=%u", (unsigned)objectID, (const char*)&address->mSelector, (unsigned)address->mSelector, (const char*)&address->mScope, (unsigned)address->mScope, (unsigned)address->mElement);
+    if (MixrVerbose()) MixrLogf("issettable obj=%u sel=%.4s/%08x sc=%.4s/%08x el=%u", (unsigned)objectID, (const char*)&address->mSelector, (unsigned)address->mSelector, (const char*)&address->mScope, (unsigned)address->mScope, (unsigned)address->mElement);
     return noErr;
 }
 
@@ -875,7 +885,7 @@ static OSStatus MixrGetPropertyDataSize(AudioServerPlugInDriverRef inDriver, Aud
     if (outDataSize != NULL) {
         *outDataSize = size;
     }
-    MixrLogf("getpropdatasize obj=%u sel=%.4s/%08x sc=%.4s/%08x el=%u r=%d size=%u", (unsigned)objectID, (const char*)&address->mSelector, (unsigned)address->mSelector, (const char*)&address->mScope, (unsigned)address->mScope, (unsigned)address->mElement, (int)r, (unsigned)size);
+    if (MixrVerbose()) MixrLogf("getpropdatasize obj=%u sel=%.4s/%08x sc=%.4s/%08x el=%u r=%d size=%u", (unsigned)objectID, (const char*)&address->mSelector, (unsigned)address->mSelector, (const char*)&address->mScope, (unsigned)address->mScope, (unsigned)address->mElement, (int)r, (unsigned)size);
     return r;
 }
 
@@ -886,7 +896,7 @@ static OSStatus MixrGetPropertyData(AudioServerPlugInDriverRef inDriver, AudioOb
     unsigned osize = (outDataSize != NULL) ? (unsigned)*outDataSize : 0xFFFFFFFFu;
     unsigned outnull = (outData == NULL) ? 1 : 0;
     unsigned first4 = (outData != NULL && inDataSize >= 4 && outDataSize != NULL && *outDataSize >= 4) ? *(unsigned*)outData : 0xdeadbeef;
-    MixrLogf("getpropdata obj=%u sel=%.4s/%08x sc=%.4s/%08x el=%u insz=%u osize=%u outnull=%u first4=%08X r=%d", (unsigned)objectID, (const char*)&address->mSelector, (unsigned)address->mSelector, (const char*)&address->mScope, (unsigned)address->mScope, (unsigned)address->mElement, (unsigned)inDataSize, osize, outnull, first4, (int)r);
+    if (MixrVerbose()) MixrLogf("getpropdataobj=%u sel=%.4s/%08x sc=%.4s/%08x el=%u insz=%u osize=%u outnull=%u first4=%08X r=%d", (unsigned)objectID, (const char*)&address->mSelector, (unsigned)address->mSelector, (const char*)&address->mScope, (unsigned)address->mScope, (unsigned)address->mElement, (unsigned)inDataSize, osize, outnull, first4, (int)r);
     return r;
 }
 
@@ -959,7 +969,7 @@ static OSStatus MixrSetPropertyData(AudioServerPlugInDriverRef inDriver, AudioOb
         }
     }
 
-    MixrLogf("setproperty obj=%u sel=%.4s/%08x sc=%.4s/%08x el=%u sz=%u r=%d", (unsigned)objectID, (const char*)&address->mSelector, (unsigned)address->mSelector, (const char*)&address->mScope, (unsigned)address->mScope, (unsigned)address->mElement, (unsigned)dataSize, (int)r);
+    if (MixrVerbose()) MixrLogf("setproperty obj=%u sel=%.4s/%08x sc=%.4s/%08x el=%u sz=%u r=%d", (unsigned)objectID, (const char*)&address->mSelector, (unsigned)address->mSelector, (const char*)&address->mScope, (unsigned)address->mScope, (unsigned)address->mElement, (unsigned)dataSize, (int)r);
     return r;
 }
 
@@ -1022,11 +1032,11 @@ static OSStatus MixrBeginIOOperation(AudioServerPlugInDriverRef inDriver, AudioO
 }
 
 static OSStatus MixrDoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID deviceID, AudioObjectID streamID, UInt32 clientID, UInt32 operationID, UInt32 ioBufferFrameSize, const AudioServerPlugInIOCycleInfo* ioCycleInfo, void* mainBuffer, void* secondaryBuffer) {
-    (void)deviceID; (void)clientID; (void)ioCycleInfo; (void)secondaryBuffer;
+    (void)deviceID; (void)clientID; (void)secondaryBuffer;
     MixrDriver* obj = MixrObject(inDriver);
     float* buffer = (float*)mainBuffer;
     uint32_t frames = ioBufferFrameSize;
-    if (buffer == NULL) return noErr;
+    if (buffer == NULL || ioCycleInfo == NULL) return noErr;
 
     // The stream carries the device's two channels (interleaved). Each device
     // loops back to itself: its output feeds only its own input.
@@ -1035,25 +1045,34 @@ static OSStatus MixrDoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObje
     const uint32_t chCount = kMixrDeviceChannels;
     const uint32_t R = kMixrRingFrameCount;
     obj->ioCycles++;
+
+    // Ring positions are derived from the device timeline the HAL hands us in
+    // ioCycleInfo. mOutputTime is where this cycle's output lands, mInputTime
+    // where its input starts; the HAL keeps the input window one buffer in the
+    // past and the output window one buffer in the future, so a reader always
+    // sees data a writer finished at least a buffer ago, whatever the two
+    // clients' buffer sizes or cycle phases are.
     if (operationID == kAudioServerPlugInIOOperationWriteMix) {
-        // out stream: interleaved stereo -> this device's own ring. Overwrite
-        // at the write position and advance it (single writer per ring).
+        // out stream: interleaved stereo -> this device's own ring at the
+        // output sample time. Overwrite: the HAL has already mixed every
+        // playback client into this buffer.
+        uint64_t start = (uint64_t)ioCycleInfo->mOutputTime.mSampleTime;
         for (uint32_t f = 0; f < frames; f++) {
-            uint32_t pos = obj->ringHead[dev];
+            uint32_t pos = (uint32_t)((start + f) % R);
             for (uint32_t c = 0; c < chCount; c++) {
                 obj->ringBuffer[(dev * chCount + c) * R + pos] = buffer[f * chCount + c];
             }
-            obj->ringHead[dev] = (obj->ringHead[dev] + 1) % R;
         }
         obj->ioFramesWritten += frames;
     } else if (operationID == kAudioServerPlugInIOOperationReadInput) {
-        // in stream: the device's own output ring feeds its own input, read one
-        // buffer behind the write position. Summing every device's ring here
-        // would put a device's output back on its own input, which closes a
-        // feedback loop as soon as a mixer app reads that input. Cross-device
-        // routing is the mixer app's job, not the driver's.
+        // in stream: the device's own output ring feeds its own input, read at
+        // the input sample time. Summing every device's ring here would put a
+        // device's output back on its own input, which closes a feedback loop
+        // as soon as a mixer app reads that input. Cross-device routing is the
+        // mixer app's job, not the driver's.
+        uint64_t start = (uint64_t)ioCycleInfo->mInputTime.mSampleTime;
         for (uint32_t f = 0; f < frames; f++) {
-            uint32_t pos = (obj->ringHead[dev] + R - frames + f) % R;
+            uint32_t pos = (uint32_t)((start + f) % R);
             for (uint32_t c = 0; c < chCount; c++) {
                 buffer[f * chCount + c] = obj->ringBuffer[(dev * chCount + c) * R + pos];
             }
